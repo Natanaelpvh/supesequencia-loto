@@ -8,30 +8,53 @@ Este sistema implementa um gerador inteligente de jogos de loteria que combina:
 - Otimização geométrica no volante
 
 Autor: Natanael
-Versão: 1.0.0
+Versão: 1.0.1
 Data: 14/06/2025
 """
 
-import numpy as np
-import pandas as pd
-from collections import Counter
+# Bibliotecas padrão
+import os
+import sys
 import random
 import math
-import os
+import pickle
+import logging
+import subprocess
+from collections import Counter
+from pathlib import Path
+from functools import lru_cache
+from typing import List, Dict, Tuple, Optional, Set
+from multiprocessing import get_context
+
+# Interface gráfica
 import tkinter as tk
 from tkinter import filedialog
+
+# Matemática e dados
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import pdist, squareform
+
+# Machine Learning
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Tuple, Optional, Set
-import logging
 from sklearn.utils import resample
-import xgboost as xgb
 from sklearn.model_selection import GridSearchCV
 from sklearn.calibration import CalibratedClassifierCV
-import sys
-import subprocess
-from scipy.spatial.distance import pdist, squareform
+
+# Visualização
+import matplotlib.pyplot as plt
+
+# Processamento paralelo
+from joblib import Parallel, delayed
+
+# XGBoost (instalação separada)
+import xgboost as xgb
+
+# Configuração para suprimir warnings específicos
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
@@ -68,12 +91,12 @@ class LotteryConfig:
     MIN_SUM = 100
     MAX_SUM = 250
 
-    # Pesos e parâmetros de probabilidade
-    FREQ_WEIGHT = 0.40
-    DELAY_WEIGHT = 0.35
-    PROB_WEIGHT = 0.25
-    TREND_WEIGHT = 0.10
-    GEOMETRY_WEIGHT = 0.15
+    # Ajuste nos pesos para valorizar mais a diversificação
+    FREQ_WEIGHT = 0.30  # Reduzido de 0.40
+    DELAY_WEIGHT = 0.40  # Aumentado de 0.35
+    PROB_WEIGHT = 0.20  # Reduzido de 0.25
+    TREND_WEIGHT = 0.10  # Mantido
+    GEOMETRY_WEIGHT = 0.15  # Novo peso para distribuição geométrica
 
     # Configurações de atraso
     LOW_DELAY_THRESHOLD = 3
@@ -103,15 +126,17 @@ class EnhancedLotteryConfig(LotteryConfig):
         MODEL_WEIGHTS (List[float]): Pesos para os modelos no ensemble [MLP, RF, XGBoost]
         SEASONAL_WINDOWS (List[int]): Janelas temporais para análise sazonal
     """
-    REQUIRED_ADVANCED_CHECKS = 1
+    """
+       Configurações estendidas com novos parâmetros avançados.
+       Herda todos os atributos de LotteryConfig e adiciona:
+       """
+    REQUIRED_ADVANCED_CHECKS = 2
     QUADRANT_MIN = 2
     MAX_GENERATION_ATTEMPTS = 100
-    REQUIRED_ADVANCED_CHECKS = 2
 
     # Novos parâmetros para análise avançada
     CONSECUTIVE_PAIR_WEIGHT = 0.15
     CORRELATION_PENALTY = 0.2
-    QUADRANT_MIN = 2
     SA_TEMPERATURE = 1.0
     SA_COOLING_RATE = 0.95
     SA_ITERATIONS = 100
@@ -122,6 +147,12 @@ class EnhancedLotteryConfig(LotteryConfig):
     # Configurações de análise temporal
     SEASONAL_WINDOWS = [10, 30, 100]  # Janelas para análise sazonal
     TREND_SENSITIVITY = 0.25
+
+    # Novos parâmetros
+    MODEL_CACHE_DIR = "model_cache"
+    PLOT_OUTPUT_DIR = "game_plots"
+    MAX_CACHED_GAMES = 1000
+    NUM_PARALLEL_JOBS = 4
 
 
 class LotteryWheel:
@@ -490,36 +521,36 @@ class AdvancedStatistics(LotteryStatistics):
     - Cálculo de correlações entre números
     - Análise sazonal
     - Clusterização de números
+    - Análise de ciclos com FFT (NOVO)
+    - Distribuição por quadrantes (NOVO)
+    - Análise de números primos (NOVO)
 
     Atributos Adicionais:
         consecutive_pairs (Dict[Tuple[int, int], int]): Contagem de pares consecutivos
         number_correlations (np.ndarray): Matriz de correlação entre números
         seasonal_trends (Dict[int, Dict[int, float]]): Tendências por janela temporal
         number_clusters (Dict[int, int]): Cluster de cada número baseado em co-ocorrência
+        prime_numbers (Set[int]): Conjunto de números primos na Lotofácil (NOVO)
+        cycles (Dict[int, Dict[int, float]]): Padrões cíclicos por número (NOVO)
+        quadrant_distributions (Dict[int, Dict[int, float]]): Distribuição por quadrante (NOVO)
     """
 
     def __init__(self, results: List[List[int]]):
-        """
-        Inicializa estatísticas avançadas chamando o construtor pai e
-        calculando métricas adicionais.
-        """
+        """Inicializa todas as análises, incluindo as novas"""
         super().__init__(results)
+        # Métodos existentes
         self.consecutive_pairs = self._analyze_consecutive_pairs()
         self.number_correlations = self._calculate_correlations()
         self.seasonal_trends = self._analyze_seasonal_trends()
         self.number_clusters = self._cluster_numbers()
 
+        # Novos atributos e análises
+        self.prime_numbers = {2, 3, 5, 7, 11, 13, 17, 19, 23}
+        self.cycles = self._detect_number_cycles()
+        self.quadrant_distributions = self._calculate_quadrant_distributions()
+
+    # --- Métodos existentes mantidos exatamente como estão ---
     def _analyze_consecutive_pairs(self) -> Dict[Tuple[int, int], int]:
-        """
-        Conta frequência de pares consecutivos nos jogos históricos.
-
-        Retorna:
-            Dict[Tuple[int, int], int]: Dicionário com contagem de cada par consecutivo
-
-        Exemplo:
-          #  >>> pairs = stats._analyze_consecutive_pairs()
-          #  >>> print(f"Frequência do par (1,2): {pairs.get((1,2), 0)}")
-        """
         pair_counts = Counter()
         for game in self.results:
             sorted_game = sorted(game)
@@ -529,115 +560,516 @@ class AdvancedStatistics(LotteryStatistics):
         return pair_counts
 
     def _calculate_correlations(self) -> np.ndarray:
-        """
-        Calcula matriz de correlação entre números baseada em co-ocorrência.
-
-        Retorna:
-            np.ndarray: Matriz 25x25 de correlações entre números (0-1)
-
-        Nota:
-            Usa correlação de Pearson entre vetores de presença
-        """
         presence_matrix = np.zeros((len(self.results), LotteryConfig.TOTAL_NUMBERS))
         for i, game in enumerate(self.results):
             presence_matrix[i, [num - 1 for num in game]] = 1
         return np.corrcoef(presence_matrix.T)
 
     def _analyze_seasonal_trends(self) -> Dict[int, Dict[int, float]]:
-        """
-        Analisa tendências sazonais em diferentes janelas temporais.
-
-        Retorna:
-            Dict[int, Dict[int, float]]: Dicionário aninhado com:
-                - Chave externa: número (1-25)
-                - Chave interna: tamanho da janela (10, 30, 100)
-                - Valor: frequência normalizada na janela
-        """
         seasonal_data = {num: {} for num in self.all_numbers}
-
         for window in EnhancedLotteryConfig.SEASONAL_WINDOWS:
             if len(self.results) < window:
                 continue
-
             window_games = self.results[-window:]
             window_counts = Counter(np.concatenate(window_games))
-
             for num in self.all_numbers:
                 seasonal_data[num][window] = window_counts.get(num, 0) / window
-
         return seasonal_data
 
     def _cluster_numbers(self) -> Dict[int, int]:
-        """
-        Agrupa números por padrões de co-ocorrência usando distância de correlação.
-
-        Retorna:
-            Dict[int, int]: Mapeamento número -> ID do cluster
-
-        Nota:
-            Usa limiar de 0.7 para definir clusters similares
-        """
         presence_matrix = np.zeros((len(self.results), LotteryConfig.TOTAL_NUMBERS))
         for i, game in enumerate(self.results):
             presence_matrix[i, [num - 1 for num in game]] = 1
-
-        # Calcula distâncias entre números (1 - correlação)
         distances = squareform(pdist(presence_matrix.T, 'correlation'))
-
-        # Clusterização simples (k-means poderia ser usado aqui)
         clusters = {}
         cluster_id = 0
-        threshold = 0.7  # Limiar de similaridade
-
+        threshold = 0.7
         for num in self.all_numbers:
             if num in clusters:
                 continue
-
             clusters[num] = cluster_id
             for other_num in self.all_numbers:
                 if num != other_num and distances[num - 1][other_num - 1] < threshold:
                     clusters[other_num] = cluster_id
-
             cluster_id += 1
-
         return clusters
 
     def get_consecutive_score(self, numbers: List[int]) -> float:
-        """
-        Calcula score baseado em pares consecutivos frequentes no jogo.
-
-        Parâmetros:
-            numbers (List[int]): Lista de números do jogo
-
-        Retorna:
-            float: Score normalizado pelo tamanho do jogo
-
-        Exemplo:
-         #   >>> score = stats.get_consecutive_score([1, 2, 3, 4, 5])
-         #  >>> print(f"Score de pares consecutivos: {score:.2f}")
-        """
         sorted_numbers = sorted(numbers)
         score = 0
-
         for i in range(len(sorted_numbers) - 1):
             pair = (sorted_numbers[i], sorted_numbers[i + 1])
             score += self.consecutive_pairs.get(pair, 0)
-
         return score / len(numbers)
 
     def get_cluster_diversity(self, numbers: List[int]) -> float:
-        """
-        Calcula diversidade de clusters em um jogo.
-
-        Parâmetros:
-            numbers (List[int]): Lista de números do jogo
-
-        Retorna:
-            float: Proporção de clusters únicos no jogo (0-1)
-        """
         clusters_in_game = {self.number_clusters[num] for num in numbers}
         return len(clusters_in_game) / len(set(self.number_clusters.values()))
 
+    # --- Novos métodos adicionados ---
+    def _detect_number_cycles(self) -> Dict[int, Dict[int, float]]:
+        """Detecta padrões cíclicos no aparecimento de cada número usando FFT"""
+        from scipy import fftpack
+
+        cycles = {}
+        for num in self.all_numbers:
+            presence = [int(num in game) for game in self.results]
+            n = len(presence)
+            if n < 10:  # Mínimo de dados para análise
+                cycles[num] = {}
+                continue
+
+            fft = fftpack.fft(presence)
+            freqs = fftpack.fftfreq(n)
+
+            num_cycles = {}
+            for i in range(1, n // 2):
+                if freqs[i] > 0:
+                    period = int(1 / freqs[i])
+                    if 2 <= period <= 50:
+                        num_cycles[period] = abs(fft[i]) / n
+
+            cycles[num] = dict(sorted(num_cycles.items(),
+                                      key=lambda x: x[1], reverse=True)[:3])
+        return cycles
+
+    def _calculate_quadrant_distributions(self) -> Dict[int, Dict[int, float]]:
+        """Calcula distribuição histórica de números por quadrantes"""
+        quadrant_counts = {q: Counter() for q in range(1, 5)}
+        for game in self.results:
+            for num in game:
+                quad = AdvancedLotteryWheel.get_quadrant(num)
+                if 1 <= quad <= 4:
+                    quadrant_counts[quad][num] += 1
+
+        total_games = len(self.results)
+        return {
+            q: {num: count / total_games for num, count in counts.items()}
+            for q, counts in quadrant_counts.items()
+        }
+
+    def get_enhanced_features(self, numbers: List[int]) -> List[float]:
+        """
+        Gera features estendidas incluindo as novas métricas
+        Mantém compatibilidade com o sistema existente
+        """
+        base_features = super().get_geometric_features(numbers)
+
+        # Features básicas
+        numbers_arr = np.array(numbers)
+        even = np.sum(numbers_arr % 2 == 0)
+        low = np.sum(numbers_arr <= 12)
+        total_sum = np.sum(numbers_arr)
+        avg_delay = np.mean([self.delay[num] for num in numbers])
+        avg_freq = np.mean([self.frequency[num] for num in numbers])
+
+        # Novas features
+        prime_ratio = sum(1 for num in numbers if num in self.prime_numbers) / len(numbers)
+        sorted_nums = sorted(numbers)
+        avg_gap = np.mean([sorted_nums[i + 1] - sorted_nums[i]
+                           for i in range(len(sorted_nums) - 1)])
+
+        # Entropia da distribuição
+        hist = np.histogram(numbers, bins=5, range=(1, 25))[0]
+        hist = hist / hist.sum()
+        entropy = -np.sum([p * np.log(p) for p in hist if p > 0])
+
+        # Features de ciclos
+        current_draw = len(self.results) + 1
+        cycle_strength = sum(
+            max(self.cycles[num].values(), default=0)
+            for num in numbers
+        )
+
+        # Features de quadrantes
+        quadrants = [AdvancedLotteryWheel.get_quadrant(num) for num in numbers]
+        quadrant_score = sum(
+            self.quadrant_distributions[q].get(num, 0)
+            for q, num in zip(quadrants, numbers) if 1 <= q <= 4
+        )
+
+        return [*base_features, total_sum, even, len(numbers) - even, low,
+                len(numbers) - low, avg_delay, avg_freq, prime_ratio,
+                avg_gap, entropy, cycle_strength, quadrant_score]
+
+    def get_number_cycle_strength(self, number: int, current_draw: int) -> float:
+        """Retorna a força do ciclo para um número no concurso atual"""
+        return sum(
+            strength for period, strength in self.cycles.get(number, {}).items()
+            if current_draw % period == 0
+        )
+
+    def get_quadrant_distribution(self, quadrant: int) -> Dict[int, float]:
+        """Retorna a distribuição histórica de um quadrante específico"""
+        return self.quadrant_distributions.get(quadrant, {})
+
+    @lru_cache(maxsize=EnhancedLotteryConfig.MAX_CACHED_GAMES)
+    def get_enhanced_features_cached(self, numbers_tuple: Tuple[int]) -> List[float]:
+        """Versão com cache do método get_enhanced_features"""
+        return self.get_enhanced_features(list(numbers_tuple))
+
+    def analyze_sequences(self, numbers: List[int]) -> Dict[str, float]:
+        """
+        Analisa sequências numéricas no jogo.
+        Retorna métricas como:
+        - Maior sequência consecutiva
+        - Razão de Fibonacci
+        - Progressões aritméticas
+        """
+        sorted_nums = sorted(numbers)
+        gaps = [sorted_nums[i + 1] - sorted_nums[i] for i in range(len(sorted_nums) - 1)]
+
+        # Calcula a maior sequência consecutiva
+        max_consec = 1
+        current = 1
+        for i in range(1, len(sorted_nums)):
+            if sorted_nums[i] == sorted_nums[i - 1] + 1:
+                current += 1
+                max_consec = max(max_consec, current)
+            else:
+                current = 1
+
+        # Calcula razão de Fibonacci
+        fib_pairs = [(sorted_nums[i], sorted_nums[i + 1])
+                     for i in range(len(sorted_nums) - 1)
+                     if sorted_nums[i + 1] / sorted_nums[i] > 1.6]
+        fib_ratio = len(fib_pairs) / (len(sorted_nums) - 1) if len(sorted_nums) > 1 else 0
+
+        return {
+            'max_consecutive': max_consec,
+            'fibonacci_ratio': fib_ratio,
+            'avg_gap': np.mean(gaps),
+            'gap_variation': np.std(gaps)
+        }
+
+class LotteryModelEnsemble:
+    """
+    Versão final com tratamento robusto de NaN e problemas de predição
+    """
+
+    def __init__(self, stats: AdvancedStatistics):
+        self.stats = stats
+        self.models = []
+        self.model_weights = EnhancedLotteryConfig.MODEL_WEIGHTS
+        self.scaler = None
+        self.loaded_from_cache = False
+        self.feature_names = [
+            'total_sum', 'even_count', 'odd_count', 'low_count', 'high_count',
+            'avg_delay', 'avg_freq', 'centroid_x', 'centroid_y', 'dispersion',
+            'quad1', 'quad2', 'quad3', 'quad4', 'prime_ratio', 'avg_gap',
+            'entropy', 'cycle_strength', 'quadrant_score'
+        ]
+
+        try:
+            if not self._try_load_from_cache():
+                self._train_with_fallbacks()
+            self._validate_initial_models()
+        except Exception as e:
+            logger.critical(f"Falha crítica: {e}")
+            self._emergency_fallback()
+
+    def _try_load_from_cache(self) -> bool:
+        """Tenta carregar modelos do cache. Retorna True se bem-sucedido."""
+        try:
+            cached_ensemble = LotteryModelEnsemble.load_models(self.stats)
+            if cached_ensemble is not None:
+                self.models = cached_ensemble.models
+                self.scaler = cached_ensemble.scaler
+                self.loaded_from_cache = True
+                logger.info("Modelos carregados do cache com sucesso")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Falha ao carregar do cache: {e}")
+            return False
+
+    def _train_with_fallbacks(self):
+        """Treinamento com tentativas de fallback se modelos falharem."""
+        try:
+            X, y = self._prepare_training_data()
+            self.scaler = StandardScaler().fit(X)
+            X_scaled = self.scaler.transform(X)
+
+            # Inicializa modelos
+            self.models = [
+                self._create_rf(),
+                self._create_mlp(),
+                self._create_xgb()
+            ]
+
+            self._train_serial(X_scaled, y)
+        except Exception as e:
+            logger.error(f"Falha no treinamento principal: {e}")
+            self._emergency_fallback(X_scaled, y)
+
+    def _prepare_training_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepara dados de treino com tratamento de NaN"""
+        try:
+            # Dados positivos
+            X_pos = np.array([self._generate_features_safe(game) for game in self.stats.results])
+            y_pos = np.ones(len(self.stats.results))
+
+            # Dados negativos
+            X_neg = []
+            for _ in range(LotteryConfig.NEGATIVE_SAMPLES_MULTIPLIER * len(self.stats.results)):
+                game = random.sample(list(self.stats.all_numbers), LotteryConfig.NUMBERS_PER_GAME)
+                while not GameValidator.validate_distribution(game):
+                    game = random.sample(list(self.stats.all_numbers), LotteryConfig.NUMBERS_PER_GAME)
+                X_neg.append(self._generate_features_safe(game))
+
+            # Combina e balanceia
+            X = np.vstack((X_pos, np.array(X_neg)))
+            y = np.concatenate((y_pos, np.zeros(len(X_neg))))
+
+            # Remove quaisquer NaNs remanescentes
+            X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
+
+            return resample(X, y, n_samples=min(len(X_pos), len(X_neg)) * 2, random_state=42)
+
+        except Exception as e:
+            logger.error(f"Erro na preparação dos dados: {e}")
+            raise
+
+    def _generate_features(self, numbers: List[int]) -> List[float]:
+        """Gera features para um conjunto de números (versão básica)."""
+        try:
+            return self.stats.get_enhanced_features(numbers)
+        except Exception as e:
+            logger.warning(f"Erro ao gerar features (versão não segura): {e}")
+            return [0.0] * len(self.feature_names)
+
+    def _generate_features_safe(self, numbers: List[int]) -> List[float]:
+        """Gera features com tratamento seguro para NaN/inf"""
+        try:
+            features = self.stats.get_enhanced_features(numbers)
+            features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=0.0)
+            return features
+        except Exception as e:
+            logger.warning(f"Erro ao gerar features: {e}")
+            return [0.0] * len(self.feature_names)
+
+    def predict_proba(self, numbers: List[int]) -> float:
+        """
+        Predição robusta com tratamento de erros e NaN
+        """
+        try:
+            features = self._generate_features_safe(numbers)
+            features = np.array(features).reshape(1, -1)
+
+            if np.isnan(features).any():
+                logger.warning("NaN detectado nas features - substituindo por zeros")
+                features = np.nan_to_num(features, nan=0.0)
+
+            features_scaled = self.scaler.transform(features)
+
+            probas = []
+            for model, weight in zip(self.models, self.model_weights):
+                try:
+                    if isinstance(model, MLPClassifier) and np.isnan(features_scaled).any():
+                        logger.warning("MLP recebeu NaN - usando fallback")
+                        proba = 0.5
+                    else:
+                        proba = model.predict_proba(features_scaled)[0][1]
+                    probas.append(proba * weight)
+                except Exception as e:
+                    logger.error(f"Erro na predição do modelo {type(model).__name__}: {e}")
+                    probas.append(0.5 * weight)
+
+            return np.mean(probas)
+        except Exception as e:
+            logger.error(f"Erro crítico na predição: {e}")
+            return 0.5
+
+    def _train_model_safely(self, idx, model, X, y):
+        """Wrapper seguro para treinamento com tratamento de NaN"""
+        try:
+            if np.isnan(X).any() or np.isnan(y).any():
+                logger.warning(f"NaN detectado nos dados de treino para modelo {idx + 1}")
+                X = np.nan_to_num(X, nan=0.0)
+                y = np.nan_to_num(y, nan=0.0)
+
+            model.fit(X, y)
+            test_X = np.nan_to_num(X[:1], nan=0.0)
+            sample_pred = model.predict(test_X)
+            if len(sample_pred) != 1:
+                raise ValueError("Predição inválida")
+            return (True, model)
+        except Exception as e:
+            logger.error(f"Erro no treinamento do modelo {idx + 1}: {e}")
+            return (False, None)
+
+    def _train_serial(self, X, y):
+        """Treinamento serial robusto."""
+        for i, model in enumerate(self.models):
+            try:
+                success, trained_model = self._train_model_safely(i, model, X, y)
+                if not success:
+                    raise RuntimeError(f"Modelo {i + 1} falhou no treinamento serial")
+                self.models[i] = trained_model
+            except Exception as e:
+                logger.error(f"Falha crítica no treinamento serial: {e}")
+                raise
+
+    def _validate_initial_models(self):
+        """Validação rigorosa dos modelos."""
+        if not self.models:
+            raise ValueError("Nenhum modelo disponível para validação")
+
+        test_numbers = [random.sample(list(self.stats.all_numbers), 15) for _ in range(5)]
+        X_test = np.array([self._generate_features_safe(nums) for nums in test_numbers])  # Usando a versão segura
+        X_test = self.scaler.transform(X_test)
+
+        for i, model in enumerate(self.models):
+            try:
+                preds = model.predict(X_test)
+                if len(preds) != 5:
+                    raise ValueError(f"Modelo {i} retornou predições inválidas")
+
+                if hasattr(model, 'predict_proba'):
+                    probas = model.predict_proba(X_test)
+                    if probas.shape[0] != 5:
+                        raise ValueError(f"Modelo {i} retornou probabilidades inválidas")
+            except Exception as e:
+                raise RuntimeError(f"Validação falhou para modelo {i}: {e}") from e
+
+    def _emergency_fallback(self, X=None, y=None):
+        """Cria modelos mínimos como último recurso."""
+        logger.critical("Ativando modo de emergência!")
+
+        try:
+            if X is None or y is None:
+                X, y = self._prepare_training_data()
+                if self.scaler is None:
+                    self.scaler = StandardScaler().fit(X)
+                X = self.scaler.transform(X)
+
+            self.models = [RandomForestClassifier(
+                n_estimators=50,
+                max_depth=5,
+                random_state=42,
+                n_jobs=1
+            )]
+            self.model_weights = [1.0]
+
+            success, model = self._train_model_safely(0, self.models[0], X, y)
+            if not success:
+                raise RuntimeError("Falha no modelo de emergência")
+
+            self.models[0] = model
+            logger.warning("Modelo de emergência criado (desempenho reduzido)")
+
+        except Exception as e:
+            logger.critical("FALHA CATASTRÓFICA: Não foi possível criar modelo mínimo")
+            raise RuntimeError("Sistema inoperante") from e
+
+    def _create_mlp(self):
+        """Cria MLP com configurações seguras."""
+        return MLPClassifier(
+            hidden_layer_sizes=(100, 50),
+            activation='relu',
+            solver='adam',
+            early_stopping=True,
+            random_state=42,
+            max_iter=500,
+            batch_size=64,
+            learning_rate_init=0.001,
+            verbose=False
+        )
+
+    def _create_rf(self):
+        """Cria RandomForest otimizado."""
+        return RandomForestClassifier(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=5,
+            random_state=42,
+            n_jobs=1,
+            verbose=0
+        )
+
+    def _create_xgb(self):
+        """Cria XGBoost com configurações seguras."""
+        return xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=3,
+            learning_rate=0.1,
+            random_state=42,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            n_jobs=1,
+            verbosity=0
+        )
+
+    def save_models(self):
+        """Salva modelos no cache com verificação de integridade."""
+        try:
+            cache_dir = Path(EnhancedLotteryConfig.MODEL_CACHE_DIR)
+            cache_dir.mkdir(exist_ok=True, parents=True)
+
+            self._validate_initial_models()
+
+            with open(cache_dir / 'scaler.pkl', 'wb') as f:
+                pickle.dump(self.scaler, f)
+
+            for i, model in enumerate(self.models):
+                temp_path = cache_dir / f'model_{i}.temp'
+                final_path = cache_dir / f'model_{i}.pkl'
+
+                with open(temp_path, 'wb') as f:
+                    pickle.dump(model, f)
+
+                with open(temp_path, 'rb') as f:
+                    loaded = pickle.load(f)
+                    if not hasattr(loaded, 'predict'):
+                        raise ValueError(f"Modelo {i} corrompido ao salvar")
+
+                temp_path.replace(final_path)
+
+            logger.info("Modelos salvos no cache com verificação de integridade")
+        except Exception as e:
+            logger.error(f"Erro ao salvar modelos: {e}")
+            for temp_file in cache_dir.glob('*.temp'):
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
+
+    @classmethod
+    def load_models(cls, stats: AdvancedStatistics) -> Optional['LotteryModelEnsemble']:
+        """
+        Tenta carregar modelos pré-treinados do cache com verificação robusta.
+        """
+        try:
+            cache_dir = Path(EnhancedLotteryConfig.MODEL_CACHE_DIR)
+            if not cache_dir.exists():
+                return None
+
+            required_files = ['scaler.pkl'] + [f'model_{i}.pkl' for i in
+                                               range(len(EnhancedLotteryConfig.MODEL_WEIGHTS))]
+            if not all((cache_dir / f).exists() for f in required_files):
+                return None
+
+            ensemble = cls.__new__(cls)
+            ensemble.stats = stats
+
+            with open(cache_dir / 'scaler.pkl', 'rb') as f:
+                ensemble.scaler = pickle.load(f)
+
+            ensemble.models = []
+            for i in range(len(EnhancedLotteryConfig.MODEL_WEIGHTS)):
+                with open(cache_dir / f'model_{i}.pkl', 'rb') as f:
+                    model = pickle.load(f)
+                    if not hasattr(model, 'predict'):
+                        raise ValueError(f"Modelo {i} inválido no cache")
+                    ensemble.models.append(model)
+
+            ensemble.loaded_from_cache = True
+            logger.info("Modelos carregados do cache com sucesso")
+            return ensemble
+
+        except Exception as e:
+            logger.warning(f"Falha ao carregar do cache: {e}")
+            return None
 
 class GameValidator:
     """
@@ -880,213 +1312,44 @@ class LotteryModel:
         return self.model.predict_proba(features_scaled)[0][1]
 
 
-class LotteryModelEnsemble:
-    """
-    Ensemble avançado combinando MLP, Random Forest e XGBoost.
+def initialize_components(self) -> bool:
+    """Inicialização robusta com tratamento completo de erros"""
+    try:
+        # 1. Verificação dos dados
+        if not self.results or len(self.results) < 10:
+            logger.error("Dados insuficientes para inicialização")
+            return False
 
-    Atributos:
-        stats (AdvancedStatistics): Estatísticas para treino
-        scaler (StandardScaler): Normalizador de features
-        models (List): Lista dos 3 modelos do ensemble
-
-    Métodos Principais:
-        _generate_features(): Gera features completas com métricas avançadas
-        _train_ensemble(): Treina os 3 modelos com dados balanceados
-        predict_proba(): Combina predições dos modelos com pesos configuráveis
-    """
-
-    def __init__(self, stats: AdvancedStatistics):
-        """
-        Inicializa o ensemble e realiza o treinamento.
-
-        Parâmetros:
-            stats (AdvancedStatistics): Estatísticas avançadas para treino
-        """
-        self.stats = stats
-        self.scaler = None
-        self.models = []
-        self._train_ensemble()
-
-    def _generate_features(self, numbers: List[int]) -> List[float]:
-        """
-        Gera features completas para um conjunto de números incluindo:
-        - Estatísticas básicas
-        - Features geométricas
-        - Métricas avançadas (pares consecutivos, clusters, sazonalidade)
-
-        Parâmetros:
-            numbers (List[int]): Lista de números a serem transformados
-
-        Retorna:
-            List[float]: Lista com 13 features calculadas
-
-        Levanta:
-            Exception: Se ocorrer erro no cálculo das features
-        """
+        # 2. Cálculo de estatísticas
         try:
-            # Features básicas
-            numbers_arr = np.array(numbers)
-            even = np.sum(numbers_arr % 2 == 0)
-            low = np.sum(numbers_arr <= 12)
-            total_sum = np.sum(numbers_arr)
-            avg_delay = np.mean([self.stats.delay[num] for num in numbers])
-            avg_freq = np.mean([self.stats.frequency[num] for num in numbers])
-
-            # Features geométricas
-            positions = [LotteryWheel.POSITIONS[num] for num in numbers]
-            x, y = zip(*positions)
-            centroid_x = np.mean(x)
-            centroid_y = np.mean(y)
-            dispersion = np.sqrt(np.var(x) + np.var(y))
-
-            # Features avançadas
-            consecutive_score = self._calculate_consecutive_score(numbers)
-            cluster_diversity = self._calculate_cluster_diversity(numbers)
-            seasonal_score = self._calculate_seasonal_score(numbers)
-
-            return [
-                total_sum,
-                even,
-                len(numbers) - even,
-                low,
-                len(numbers) - low,
-                avg_delay,
-                avg_freq,
-                centroid_x,
-                centroid_y,
-                dispersion,
-                consecutive_score,
-                cluster_diversity,
-                seasonal_score
-            ]
+            self.stats = AdvancedStatistics(self.results)
         except Exception as e:
-            logger.error(f"Erro ao gerar features: {e}")
-            raise
+            logger.error(f"Falha no cálculo de estatísticas: {str(e)}")
+            return False
 
-    def _calculate_consecutive_score(self, numbers: List[int]) -> float:
-        """Calcula score baseado em pares consecutivos frequentes"""
-        sorted_numbers = sorted(numbers)
-        score = 0.0
-        for i in range(len(sorted_numbers) - 1):
-            pair = (sorted_numbers[i], sorted_numbers[i + 1])
-            score += self.stats.consecutive_pairs.get(pair, 0)
-        return score / len(numbers)
-
-    def _calculate_cluster_diversity(self, numbers: List[int]) -> float:
-        """Calcula diversidade de clusters em um jogo (0-1)"""
-        clusters = [self.stats.number_clusters[num] for num in numbers]
-        unique_clusters = len(set(clusters))
-        return unique_clusters / len(set(self.stats.number_clusters.values()))
-
-    def _calculate_seasonal_score(self, numbers: List[int]) -> float:
-        """Calcula score sazonal médio nas janelas configuradas"""
-        score = 0.0
-        count = 0
-        for num in numbers:
-            for window in EnhancedLotteryConfig.SEASONAL_WINDOWS:
-                if window in self.stats.seasonal_trends[num]:
-                    score += self.stats.seasonal_trends[num][window]
-                    count += 1
-        return score / count if count > 0 else 0.0
-
-    def _train_ensemble(self):
-        """Treina o ensemble com MLP, Random Forest e XGBoost"""
+        # 3. Inicialização do ensemble (com fallback garantido)
         try:
-            # 1. Preparar dados
-            X, y = self._prepare_training_data()
+            self.model = LotteryModelEnsemble(self.stats)
 
-            # 2. Normalização
-            self.scaler = StandardScaler().fit(X)
-            X_scaled = self.scaler.transform(X)
-
-            # 3. Configuração dos modelos
-            self.models = [
-                # MLP com 2 camadas ocultas
-                MLPClassifier(
-                    hidden_layer_sizes=(100, 50),
-                    activation='relu',
-                    solver='adam',
-                    early_stopping=True,
-                    max_iter=2000,
-                    random_state=42
-                ),
-                # Random Forest com 200 árvores
-                RandomForestClassifier(
-                    n_estimators=200,
-                    max_depth=10,
-                    random_state=42
-                ),
-                # XGBoost com configuração otimizada
-                xgb.XGBClassifier(
-                    n_estimators=150,
-                    max_depth=6,
-                    learning_rate=0.1,
-                    subsample=0.8,
-                    colsample_bytree=0.8,
-                    random_state=42
-                )
-            ]
-
-            # 4. Treino paralelo
-            for model in self.models:
-                model.fit(X_scaled, y)
-
-            logger.info("Ensemble treinado com sucesso")
+            # Verificação básica do ensemble
+            if not hasattr(self.model, 'predict_proba') or not self.model.models:
+                raise ValueError("Ensemble inválido")
 
         except Exception as e:
-            logger.error(f"Falha no treino do ensemble: {str(e)}")
-            raise
+            logger.error(f"Falha crítica nos modelos: {str(e)}")
+            return False
 
-    def _prepare_training_data(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepara dados balanceados para treino do ensemble"""
-        # Dados positivos (jogos reais)
-        X_pos = np.array([self._generate_features(game) for game in self.stats.results])
-        y_pos = np.ones(len(self.stats.results))
-
-        # Dados negativos (jogos aleatórios válidos)
-        X_neg = []
-        for _ in range(LotteryConfig.NEGATIVE_SAMPLES_MULTIPLIER * len(self.stats.results)):
-            game = self._generate_random_valid_game()
-            X_neg.append(self._generate_features(game))
-
-        # Balanceamento
-        X = np.vstack((X_pos, np.array(X_neg)))
-        y = np.concatenate((y_pos, np.zeros(len(X_neg))))
-
-        return resample(X, y, n_samples=min(len(X_pos), len(X_neg)) * 2, random_state=42)
-
-    def _generate_random_valid_game(self) -> List[int]:
-        """Gera jogos aleatórios que atendem às regras básicas"""
-        for _ in range(1000):  # Limite de tentativas
-            game = random.sample(list(self.stats.all_numbers), LotteryConfig.NUMBERS_PER_GAME)
-            if GameValidator.validate_distribution(game):
-                return game
-        raise ValueError("Não foi possível gerar jogo válido após 1000 tentativas")
-
-    def predict_proba(self, numbers: List[int]) -> float:
-        """
-        Combina predições dos 3 modelos com pesos configuráveis.
-
-        Parâmetros:
-            numbers (List[int]): Lista de números a serem avaliados
-
-        Retorna:
-            float: Probabilidade média ponderada (0-1)
-
-        Levanta:
-            Exception: Se ocorrer erro durante a predição
-        """
+        # 4. Inicialização do gerador
         try:
-            features = self._generate_features(numbers)
-            features_scaled = self.scaler.transform([features])
-
-            probas = [model.predict_proba(features_scaled)[0][1] for model in self.models]
-            return np.average(probas, weights=EnhancedLotteryConfig.MODEL_WEIGHTS)
-
+            self.generator = EnhancedLotteryGenerator(self.stats, self.model)
+            return True
         except Exception as e:
-            logger.error(f"Erro na predição: {str(e)}")
-            raise
+            logger.error(f"Falha no gerador: {str(e)}")
+            return False
 
+    except Exception as e:
+        logger.critical(f"Falha na inicialização: {str(e)}")
+        return False
 
 class LotteryGenerator:
     """
@@ -1115,43 +1378,75 @@ class LotteryGenerator:
         self.model = model
 
     def generate_optimized_games(self, num_games: int = LotteryConfig.GAMES_TO_GENERATE) -> List[List[int]]:
-        """
-        Gera jogos otimizados usando estatísticas e modelo.
-
-        Parâmetros:
-            num_games (int): Quantidade de jogos a gerar
-
-        Retorna:
-            List[List[int]]: Lista de jogos gerados
-
-        Algoritmo:
-            1. Pré-calcula features e probabilidades
-            2. Para cada jogo a ser gerado:
-                a. Calcula scores para cada número
-                b. Seleciona números ponderados pelo score
-                c. Valida o jogo gerado
-        """
-        max_freq = max(self.stats.frequency.values()) or 1
         games = []
+        attempt_count = 0
+        max_attempts = num_games * 3  # Aumentado o limite de tentativas
 
-        # Pré-calcula features e probabilidades
-        features = np.array([
-            self.model._generate_features([num]) for num in self.stats.all_numbers
-        ])
-        features_scaled = self.model.scaler.transform(features)
-        probabilities = self.model.model.predict_proba(features_scaled)[:, 1]
+        while len(games) < num_games and attempt_count < max_attempts:
+            attempt_count += 1
+            game = self._generate_with_model_scores()
 
-        while len(games) < num_games:
-            # Calcula scores para cada número
-            scores = self._calculate_scores(max_freq, probabilities)
+            if game and len(set(game)) == LotteryConfig.NUMBERS_PER_GAME:  # Verificação explícita
+                games.append(sorted(game))
 
-            # Seleciona números ponderados pelo score
-            selected = self._select_numbers(scores)
+        # Fallback seguro com verificação reforçada
+        if len(games) < num_games:
+            additional = self._generate_simple_games(num_games - len(games), games)
+            games.extend([g for g in additional if len(set(g)) == LotteryConfig.NUMBERS_PER_GAME])
 
-            if self._is_valid_game(selected, games):
-                games.append(selected)
+        return games[:num_games]  # Garante retornar apenas a quantidade solicitada
 
-        return games
+    def _generate_simple_games(self, quantity: int, existing_games: List[List[int]]) -> List[List[int]]:
+        """Geração alternativa garantindo formato correto"""
+        simple_games = []
+
+        for _ in range(quantity):
+            while True:
+                # Gera jogo aleatório básico já como inteiros
+                game = sorted(random.sample(range(1, LotteryConfig.TOTAL_NUMBERS + 1),
+                                            LotteryConfig.NUMBERS_PER_GAME))
+
+                # Verifica se é único e válido
+                if game not in existing_games and game not in simple_games:
+                    simple_games.append(game)
+                    break
+
+        return simple_games
+
+    def display_games(self, games: List[List[int]]):
+        """Exibe os jogos formatados corretamente"""
+        print("\nJogos gerados:")
+        for i, game in enumerate(games, 1):
+            print(f"Jogo {i}: {game}")
+
+    def _generate_fallback_games(self, num_games: int, existing_games: List[List[int]]) -> List[List[int]]:
+        """Método alternativo para completar a geração se necessário"""
+        fallback_games = []
+        for _ in range(num_games):
+            while True:
+                # Gera jogo aleatório básico
+                game = sorted(random.sample(range(1, LotteryConfig.TOTAL_NUMBERS + 1),
+                                            LotteryConfig.NUMBERS_PER_GAME))
+                game_ints = list(map(int, game))  # Conversão explícita
+
+                # Verifica se é único e válido
+                if (game_ints not in existing_games and
+                        game_ints not in fallback_games and
+                        self._is_valid_basic_game(game_ints)):
+                    fallback_games.append(game_ints)
+                    break
+
+        return fallback_games
+
+    def _is_valid_basic_game(self, game: List[int]) -> bool:
+        """Validação básica reforçada"""
+        return (
+                len(game) == LotteryConfig.NUMBERS_PER_GAME and
+                all(1 <= num <= LotteryConfig.TOTAL_NUMBERS for num in game) and
+                len(set(game)) == LotteryConfig.NUMBERS_PER_GAME and  # Sem duplicatas
+                GameValidator.validate_distribution(game) and
+                GameValidator.avoid_common_patterns(game)
+        )
 
     def _calculate_scores(self, max_freq: int, probabilities: np.ndarray) -> Dict[int, float]:
         """
@@ -1250,20 +1545,7 @@ class LotteryGenerator:
 class EnhancedLotteryGenerator(LotteryGenerator):
     """
     Gerador avançado com múltiplas otimizações e validações.
-    Herda de LotteryGenerator e adiciona:
-    - Balanceamento em 4 níveis
-    - Validações avançadas
-    - Fallback para geração básica
-
-    Atributos Adicionais:
-        ensemble_model (LotteryModelEnsemble): Ensemble para predição
-        base_model (LotteryModel): Modelo básico como fallback
-        generation_attempts (int): Contador de tentativas
-
-    Métodos Adicionais:
-        _generate_initial_game(): Gera jogo inicial por scores
-        _optimize_game_balance(): Aplica 4 níveis de otimização
-        _is_valid_enhanced_game(): Validação com regras avançadas
+    Versão completa e corrigida com todos os métodos implementados.
     """
 
     def __init__(self, stats: AdvancedStatistics, model: LotteryModelEnsemble):
@@ -1274,144 +1556,282 @@ class EnhancedLotteryGenerator(LotteryGenerator):
             stats (AdvancedStatistics): Estatísticas avançadas
             model (LotteryModelEnsemble): Ensemble treinado
         """
+        super().__init__(stats, model)
         self.stats = stats
         self.ensemble_model = model
         self.base_model = LotteryModel(stats)
         self.generation_attempts = 0
+        self.max_optimization_attempts = 500  # Aumentado de 100 para 500
+        self.required_advanced_checks = 2  # Reduzido de 3 para 2
+        self._cached_scores = {}
+        self._last_calculation_time = 0
+        self.fallback_count = 0
+        self.successful_generations = 0
 
     def generate_optimized_games(self, num_games: int = LotteryConfig.GAMES_TO_GENERATE) -> List[List[int]]:
-        """
-        Gera jogos otimizados com todas as validações e otimizações.
-
-        Parâmetros:
-            num_games (int): Quantidade de jogos a gerar
-
-        Retorna:
-            List[List[int]]: Lista de jogos gerados
-
-        Algoritmo:
-            1. Geração inicial baseada em scores híbridos
-            2. Otimização em 4 níveis:
-               a. Balanceamento par/ímpar
-               b. Balanceamento baixo/alto
-               c. Distribuição por quadrantes
-               d. Verificação final
-            3. Se falhar, usa fallback básico
-        """
+        """Gera jogos otimizados garantindo que os números sejam inteiros Python"""
         games = []
-        attempts = 0
-        max_attempts = num_games * 50
+        total_attempts = 0
 
-        while len(games) < num_games and attempts < max_attempts:
-            attempts += 1
+        logger.info(f"Iniciando geração de {num_games} jogos otimizados")
+
+        while len(games) < num_games and total_attempts < self.max_optimization_attempts:
+            total_attempts += 1
             try:
-                # Geração inicial
-                game = self._generate_initial_game()
-
-                # Otimização em múltiplos níveis
-                optimized_game = self._optimize_game_balance(game)
-
-                # Validação final
-                if optimized_game and self._is_valid_enhanced_game(optimized_game, games):
-                    games.append(optimized_game)
-                    logger.info(f"Jogo {len(games)}/{num_games} gerado")
-                    attempts = 0  # Reset do contador após sucesso
+                game = self._generate_with_optimization()
+                if game:
+                    # Conversão explícita para inteiros Python
+                    converted_game = [int(num) for num in game]
+                    if self._validate_enhanced_game(converted_game, games):
+                        games.append(converted_game)
+                        self.successful_generations += 1
+                        logger.info(f"✅ Jogo {len(games)}/{num_games} gerado (Tentativa {total_attempts})")
 
             except Exception as e:
-                logger.debug(f"Tentativa {attempts} falhou: {str(e)}")
-                continue
+                logger.debug(f"Tentativa {total_attempts} falhou: {str(e)}")
 
-        # Fallback garantido
+        # Fallback controlado se necessário
         if len(games) < num_games:
             missing = num_games - len(games)
-            logger.warning(f"Gerando {missing} jogos via método básico (fallback)")
-            games.extend(self._generate_fallback_games(missing))
+            self.fallback_count += missing
+            logger.warning(f"⚠️ Gerando {missing} jogos via método básico (fallback)")
+            fallback_games = self._generate_smart_fallback_games(missing, games)
+            # Conversão explícita para inteiros Python nos jogos de fallback
+            games.extend([[int(num) for num in game] for game in fallback_games])
 
-        return games
+        logger.info(f"🔍 Estatísticas: {self.successful_generations} otimizados, {self.fallback_count} fallbacks")
+        return games[:num_games]
 
-    def _generate_initial_game(self) -> List[int]:
-        """Gera jogo inicial baseado em scores híbridos"""
-        scores = self._calculate_hybrid_scores()
-        valid_numbers = [
-            num for num in self.stats.all_numbers
-            if self.stats.delay[num] <= LotteryConfig.MAX_DELAY
-        ]
-        valid_scores = [scores[num] for num in valid_numbers]
+    def _generate_with_optimization(self) -> Optional[List[int]]:
+        """Geração com múltiplas camadas de otimização"""
+        # 1. Geração inicial com modelo
+        game = self._generate_with_model_scores()
+        if not game:
+            return None
 
-        # Conversão para probabilidades com softmax
-        exp_scores = np.exp(valid_scores - np.max(valid_scores))
-        prob = exp_scores / np.sum(exp_scores)
+        # 2. Balanceamentos progressivos
+        game = self._balance_game_progressive(game)
 
-        # Seleção sem repetição
-        selected = np.random.choice(
-            valid_numbers,
-            size=LotteryConfig.NUMBERS_PER_GAME,
-            replace=False,
-            p=prob
-        )
+        return sorted(game) if self._is_valid_basic_game(game) else None
 
-        return sorted(selected.tolist())
+    def _generate_with_model_scores(self) -> Optional[List[int]]:
+        """Geração de jogos otimizados com garantia de qualidade"""
+        try:
+            # 1. Pré-processamento: converter para int e filtrar válidos
+            all_numbers = list(map(int, self.stats.all_numbers))  # Garante tipo int
+            eligible = [num for num in all_numbers if self.stats.delay[num] <= LotteryConfig.MAX_DELAY]
 
-    def _calculate_hybrid_scores(self) -> Dict[int, float]:
-        """Calcula scores combinando ensemble, atraso, frequência e tendência"""
+            # 2. Cálculo de scores com penalidades inteligentes
+            scores = self._calculate_scores_with_penalties(eligible)
+
+            # 3. Geração do jogo com múltiplas camadas de validação
+            game = self._generate_valid_game(eligible, scores)
+
+            return sorted(game) if game else None
+
+        except Exception as e:
+            logger.error(f"Erro na geração: {str(e)}", exc_info=True)
+            return None
+
+    def _calculate_scores_with_penalties(self, eligible: List[int]) -> Dict[int, float]:
+        """Calcula scores com penalidades para números recentes"""
         scores = {}
-        for num in self.stats.all_numbers:
-            # Probabilidade do modelo ensemble
-            ensemble_prob = self.ensemble_model.predict_proba([num])
+        recent_games = self.stats.results[-10:] if len(self.stats.results) >= 10 else self.stats.results
+        recent_counts = Counter(num for game in recent_games for num in game)
 
-            # Fatores estatísticos
-            delay = self.stats.delay[num]
-            freq = self.stats.frequency[num] / len(self.stats.results)
-            trend = 0.1 if self.stats.trends[num] == "heating" else -0.05
+        for num in eligible:
+            base_score = self._calculate_number_score(num)
+            # Penaliza números que apareceram muito recentemente
+            penalty = 0.4 * (recent_counts.get(num, 0) / max(1, len(recent_games))) # Score mínimo garantido
+            scores[num] = max(0.1, base_score - penalty)
 
-            # Score final ponderado
-            scores[num] = (
-                    0.4 * ensemble_prob +
-                    0.3 * (1 / (delay + 1)) +
-                    0.2 * freq +
-                    0.1 * trend
-            )
         return scores
 
-    def _optimize_game_balance(self, game: List[int]) -> Optional[List[int]]:
-        """
-        Aplica 4 níveis de otimização ao jogo:
-        1. Balanceamento par/ímpar
-        2. Balanceamento baixo/alto
-        3. Distribuição por quadrantes
-        4. Verificação final
+    def _generate_valid_game(self, eligible: List[int], scores: Dict[int, float]) -> List[int]:
+        """Gera um jogo válido com até 100 tentativas, garantindo números únicos"""
+        for _ in range(100):  # Limite de tentativas
+            selected = set()
 
-        Parâmetros:
-            game (List[int]): Jogo a ser otimizado
+            # Seleção estratificada garantindo unicidade
+            low_nums = [n for n in eligible if n <= 12 and n not in selected]
+            high_nums = [n for n in eligible if n > 12 and n not in selected]
 
-        Retorna:
-            Optional[List[int]]: Jogo otimizado ou None se falhar
-        """
-        optimized = game.copy()
+            # Seleciona 5 números baixos únicos
+            selected.update(self._select_numbers(low_nums, scores, min(5, len(low_nums))))
 
-        # 1. Balanceamento par/ímpar
-        optimized = self._balance_even_odd(optimized)
-        if not optimized:
+            # Seleciona 10 números altos únicos
+            selected.update(self._select_numbers(high_nums, scores, min(10, len(high_nums))))
+
+            # Verifica se precisa completar o jogo
+            needed = LotteryConfig.NUMBERS_PER_GAME - len(selected)
+            if needed > 0:
+                remaining = [n for n in eligible if n not in selected]
+                selected.update(self._select_numbers(remaining, scores, min(needed, len(remaining))))
+
+            game = sorted(selected)
+            if (len(game) == LotteryConfig.NUMBERS_PER_GAME and
+                    self._is_valid_basic_game(game)):
+                return game
+
+        # Fallback: geração aleatória simples com verificação
+        return self._generate_fallback_game(eligible)
+
+    def _select_numbers(self, pool: List[int], scores: Dict[int, float], count: int) -> List[int]:
+        """Seleciona números ponderados pelo score"""
+        if not pool or count <= 0:
+            return []
+
+        try:
+            weights = np.array([scores.get(num, 0.1) for num in pool])
+            weights = np.maximum(weights, 0.01)  # Evita pesos zerados
+            weights /= weights.sum()  # Normaliza
+
+            return np.random.choice(pool, size=count, replace=False, p=weights).tolist()
+        except:
+            # Fallback para seleção uniforme
+            return np.random.choice(pool, size=count, replace=False).tolist()
+
+    def _generate_fallback_game(self, eligible: List[int]) -> List[int]:
+        """Geração de fallback garantindo números únicos"""
+        game = []
+        remaining = eligible.copy()
+
+        while len(game) < LotteryConfig.NUMBERS_PER_GAME and remaining:
+            # Seleciona aleatoriamente mantendo distribuição básica
+            if len(game) < 5:  # Pelo menos 5 números baixos
+                candidates = [n for n in remaining if n <= 12]
+            else:
+                candidates = remaining
+
+            if not candidates:
+                candidates = remaining
+
+            num = random.choice(candidates)
+            game.append(num)
+            remaining.remove(num)  # Remove para evitar duplicatas
+
+        return game if len(game) == LotteryConfig.NUMBERS_PER_GAME else None
+
+    def _normalize_scores(self, scores: Dict[int, float], numbers: List[int]) -> np.ndarray:
+        """Normaliza scores para distribuição de probabilidade"""
+        weights = np.array([scores.get(num, 0.1) for num in numbers])  # Usa 0.1 como padrão se não existir
+        return weights / weights.sum()
+
+    def _balance_game_progressive(self, game: List[int]) -> List[int]:
+        """Aplica balanceamentos sem falhar completamente"""
+        balanced = game.copy()
+
+        # Ordem de prioridade para balanceamentos
+        balance_steps = [
+            self._balance_even_odd,
+            self._balance_low_high,
+            self._balance_quadrants,
+            lambda g: self._adjust_prime_count(g, target=5),
+            lambda g: self._boost_cycle_numbers(g)
+        ]
+
+        for step in balance_steps:
+            try:
+                result = step(balanced)
+                if result:
+                    balanced = result
+            except:
+                continue
+
+        return balanced
+
+    def _validate_enhanced_game(self, game: List[int], existing_games: List[List[int]]) -> bool:
+        """Validação mais flexível com menos requisitos obrigatórios"""
+        if not game or len(game) != LotteryConfig.NUMBERS_PER_GAME:
+            return False
+
+        # Verificações básicas obrigatórias
+        basic_checks = [
+            GameValidator.validate_distribution(game),
+            GameValidator.avoid_common_patterns(game),
+            game not in existing_games
+        ]
+        if not all(basic_checks):
+            return False
+
+        # Verificações avançadas (apenas 2 necessárias)
+        advanced_checks = [
+            self._check_quadrants(game),
+            self._check_clusters(game),
+            self._check_correlations(game)
+        ]
+
+        return sum(advanced_checks) >= self.required_advanced_checks
+
+    def _check_quadrants(self, game: List[int]) -> bool:
+        """Versão flexível da verificação de quadrantes"""
+        quad_counts = Counter(AdvancedLotteryWheel.get_quadrant(num) for num in game)
+        return all(qc >= max(1, EnhancedLotteryConfig.QUADRANT_MIN - 1) for qc in quad_counts.values())
+
+    def _check_clusters(self, game: List[int]) -> bool:
+        """Versão flexível de clusters"""
+        clusters = {self.stats.number_clusters[num] for num in game}
+        return len(clusters) >= 2  # Reduzido de 3 para 2
+
+    def _check_correlations(self, game: List[int]) -> bool:
+        """Versão tolerante de correlações"""
+        for i, num1 in enumerate(game):
+            for num2 in game[i + 1:]:
+                if self.stats.number_correlations[num1 - 1][num2 - 1] > 0.8:  # Aumentado de 0.7 para 0.8
+                    return False
+        return True
+
+    def _generate_smart_fallback_games(self, num_games: int, existing_games: List[List[int]]) -> List[List[int]]:
+        """Fallback inteligente que mantém algumas otimizações"""
+        fallback_games = []
+
+        while len(fallback_games) < num_games:
+            # Tenta gerar com modelo básico primeiro
+            game = self._generate_with_base_model()
+            if not game:
+                # Fallback total se necessário
+                game = self._generate_random_valid_game()
+
+            if game and game not in existing_games and game not in fallback_games:
+                fallback_games.append(game)
+
+        return fallback_games
+
+    def _generate_with_base_model(self) -> Optional[List[int]]:
+        """Versão simplificada usando apenas o modelo básico"""
+        try:
+            scores = {num: self.base_model.predict_proba([num])
+                      for num in self.stats.all_numbers}
+
+            valid_nums = [n for n in scores.keys()
+                          if self.stats.delay[n] <= LotteryConfig.MAX_DELAY]
+
+            if not valid_nums:
+                return None
+
+            selected = np.random.choice(
+                valid_nums,
+                size=LotteryConfig.NUMBERS_PER_GAME,
+                replace=False,
+                p=[scores[num] for num in valid_nums]
+            )
+
+            return sorted(selected.tolist())
+
+        except:
             return None
 
-        # 2. Balanceamento baixo/alto
-        optimized = self._balance_low_high(optimized)
-        if not optimized:
-            return None
-
-        # 3. Distribuição por quadrantes
-        optimized = self._balance_quadrants(optimized)
-        if not optimized:
-            return None
-
-        # 4. Verificação final
-        return optimized if self._is_valid_basic_game(optimized) else None
+    def _generate_random_valid_game(self) -> List[int]:
+        """Geração aleatória com validação básica"""
+        while True:
+            game = random.sample(list(self.stats.all_numbers), LotteryConfig.NUMBERS_PER_GAME)
+            if GameValidator.validate_distribution(game):
+                return sorted(game)
 
     def _balance_even_odd(self, game: List[int]) -> Optional[List[int]]:
-        """Garante balanceamento entre pares e ímpares"""
+        """Balanceia pares e ímpares no jogo"""
         even_count = sum(1 for num in game if num % 2 == 0)
 
-        # Ajusta se estiver fora dos limites configurados
         if even_count < LotteryConfig.MIN_EVEN:
             return self._adjust_number_type(game, target_even=True)
         elif even_count > LotteryConfig.MAX_EVEN:
@@ -1420,10 +1840,9 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         return game
 
     def _balance_low_high(self, game: List[int]) -> Optional[List[int]]:
-        """Garante balanceamento entre números baixos e altos"""
+        """Balanceia números baixos (1-12) e altos (13-25)"""
         low_count = sum(1 for num in game if num <= 12)
 
-        # Ajusta se estiver fora dos limites
         if low_count < LotteryConfig.MIN_LOW:
             return self._adjust_number_range(game, target_low=True)
         elif low_count > LotteryConfig.MAX_LOW:
@@ -1435,9 +1854,8 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         """Garante distribuição mínima por quadrantes"""
         quad_counts = Counter(AdvancedLotteryWheel.get_quadrant(num) for num in game)
 
-        # Ajusta quadrantes com menos de 2 números
         for q in range(1, 5):
-            if quad_counts.get(q, 0) < 2:
+            if quad_counts.get(q, 0) < EnhancedLotteryConfig.QUADRANT_MIN:
                 adjusted = self._adjust_quadrant(game, q)
                 if not adjusted or not self._is_valid_basic_game(adjusted):
                     return None
@@ -1458,7 +1876,6 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         if not candidates:
             return None
 
-        # Encontra o pior número do tipo oposto para substituir
         to_replace = [n for n in game if (n % 2 == 0) != target_even]
         if not to_replace:
             return game
@@ -1482,7 +1899,6 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         if not candidates:
             return None
 
-        # Encontra o pior número do range oposto
         to_replace = [n for n in game if (n <= threshold) != target_low]
         if not to_replace:
             return game
@@ -1493,7 +1909,7 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         return sorted([n if n != replace_num else new_num for n in game])
 
     def _adjust_quadrant(self, game: List[int], target_quad: int) -> Optional[List[int]]:
-        """Substitui números para melhorar distribuição por quadrantes"""
+        """Ajusta a distribuição por quadrantes"""
         current_numbers = set(game)
         candidates = [
             n for n in self.stats.all_numbers
@@ -1505,11 +1921,9 @@ class EnhancedLotteryGenerator(LotteryGenerator):
         if not candidates:
             return None
 
-        # Encontra o quadrante com excesso
         quad_counts = Counter(AdvancedLotteryWheel.get_quadrant(n) for n in game)
         over_quad = max(quad_counts.keys(), key=lambda x: quad_counts[x])
 
-        # Substitui o pior número do quadrante com excesso
         to_replace = [n for n in game if AdvancedLotteryWheel.get_quadrant(n) == over_quad]
         if not to_replace:
             return game
@@ -1519,73 +1933,179 @@ class EnhancedLotteryGenerator(LotteryGenerator):
 
         return sorted([n if n != replace_num else new_num for n in game])
 
+    def _adjust_prime_count(self, game: List[int], target: int = 5) -> Optional[List[int]]:
+        """Ajusta a quantidade de números primos no jogo"""
+        current_primes = [n for n in game if n in self.stats.prime_numbers]
+        current_non_primes = [n for n in game if n not in self.stats.prime_numbers]
+
+        if len(current_primes) < target:
+            available_primes = [
+                n for n in self.stats.all_numbers
+                if n not in game
+                   and n in self.stats.prime_numbers
+                   and self.stats.delay[n] <= LotteryConfig.MAX_DELAY
+            ]
+
+            if not available_primes:
+                return None
+
+            game_copy = game.copy()
+            for _ in range(target - len(current_primes)):
+                if not current_non_primes:
+                    break
+
+                worst_num = min(current_non_primes, key=lambda x: self._calculate_number_score(x))
+                best_prime = max(available_primes, key=lambda x: self._calculate_number_score(x))
+
+                game_copy.remove(worst_num)
+                game_copy.append(best_prime)
+
+                current_non_primes.remove(worst_num)
+                available_primes.remove(best_prime)
+
+            return sorted(game_copy)
+        else:
+            game_copy = game.copy()
+            for _ in range(len(current_primes) - target):
+                worst_prime = min(current_primes, key=lambda x: self._calculate_number_score(x))
+                best_non_prime = max(
+                    [n for n in self.stats.all_numbers
+                     if n not in game
+                     and n not in self.stats.prime_numbers
+                     and self.stats.delay[n] <= LotteryConfig.MAX_DELAY],
+                    key=lambda x: self._calculate_number_score(x)
+                )
+
+                if not best_non_prime:
+                    return None
+
+                game_copy.remove(worst_prime)
+                game_copy.append(best_non_prime)
+                current_primes.remove(worst_prime)
+
+            return sorted(game_copy)
+
+    def _boost_cycle_numbers(self, game: List[int]) -> Optional[List[int]]:
+        """
+        Aumenta a quantidade de números com ciclos fortes.
+        Retorna o jogo ajustado ou None se não for possível.
+
+        Correções aplicadas:
+        - Parênteses faltando na chamada de min()
+        - Indentação correta do bloco for
+        - Verificação de replacements > 0
+        """
+        current_cycle_strengths = {
+            n: self.stats.get_number_cycle_strength(n, len(self.stats.results) + 1)
+            for n in game
+        }
+
+        strong_cycle_numbers = [
+            n for n in self.stats.all_numbers
+            if n not in game
+               and self.stats.get_number_cycle_strength(n, len(self.stats.results) + 1) > 0.7
+               and self.stats.delay[n] <= LotteryConfig.MAX_DELAY
+        ]
+
+        if not strong_cycle_numbers:
+            return None
+
+        game_copy = game.copy()
+        replacements = min(
+            3 - sum(1 for s in current_cycle_strengths.values() if s > 0.5),
+            len(strong_cycle_numbers)
+        )  # Fechamento do parêntese adicionado
+
+        # Verifica se há substituições a fazer
+        if replacements <= 0:
+            return game_copy
+
+        for _ in range(replacements):
+            worst_num = min(game_copy, key=lambda x: current_cycle_strengths.get(x, 0))
+            best_cycle_num = max(
+                strong_cycle_numbers,
+                key=lambda x: self.stats.get_number_cycle_strength(x, len(self.stats.results) + 1)
+            )
+
+            game_copy.remove(worst_num)
+            game_copy.append(best_cycle_num)
+            strong_cycle_numbers.remove(best_cycle_num)
+
+        return sorted(game_copy)
+
     def _calculate_number_score(self, number: int) -> float:
         """Calcula o score completo de um número individual"""
-        ensemble_prob = self.ensemble_model.predict_proba([number])
-        delay = self.stats.delay[number]
-        freq = self.stats.frequency[number] / len(self.stats.results)
-        trend = 0.1 if self.stats.trends[number] == "heating" else -0.05
+        if number in self._cached_scores:
+            return self._cached_scores[number]
 
-        return (
-                0.4 * ensemble_prob +
-                0.3 * (1 / (delay + 1)) +
-                0.2 * freq +
-                0.1 * trend
-        )
+        try:
+            ensemble_prob = self.ensemble_model.predict_proba([number])
+            delay = self.stats.delay[number]
+            freq = self.stats.frequency[number] / max(1, len(self.stats.results))
+
+            if delay <= LotteryConfig.LOW_DELAY_THRESHOLD:
+                delay_weight = LotteryConfig.LOW_DELAY_WEIGHT
+            elif delay <= LotteryConfig.MEDIUM_DELAY_THRESHOLD:
+                delay_weight = LotteryConfig.MEDIUM_DELAY_WEIGHT
+            else:
+                delay_weight = LotteryConfig.HIGH_DELAY_WEIGHT
+
+            trend = LotteryConfig.TREND_WEIGHT if self.stats.trends[
+                                                      number] == "heating" else -LotteryConfig.TREND_WEIGHT
+
+            score = (
+                    LotteryConfig.FREQ_WEIGHT * freq +
+                    delay_weight * (1 / (delay + 1)) +
+                    LotteryConfig.PROB_WEIGHT * ensemble_prob +
+                    trend
+            )
+
+            self._cached_scores[number] = score
+            return score
+
+        except Exception:
+            return 0.5  # Valor padrão em caso de erro
 
     def _is_valid_basic_game(self, game: List[int]) -> bool:
-        """Validação básica do jogo (tamanho, distribuição, padrões)"""
-        return (
-                len(game) == LotteryConfig.NUMBERS_PER_GAME and
-                GameValidator.validate_distribution(game) and
-                GameValidator.avoid_common_patterns(game)
-        )
+        """Validação básica do jogo incluindo verificação de duplicatas"""
+        if len(game) != LotteryConfig.NUMBERS_PER_GAME:
+            return False
+
+        # Verifica duplicatas
+        if len(set(game)) != len(game):
+            return False
+
+        # Restante da validação original...
+        numbers_arr = np.array(game)
+        even = np.sum(numbers_arr % 2 == 0)
+        low = np.sum(numbers_arr <= 12)
+        total_sum = np.sum(numbers_arr)
+
+        return all([
+            LotteryConfig.MIN_EVEN <= even <= LotteryConfig.MAX_EVEN,
+            LotteryConfig.MIN_ODD <= (len(game) - even) <= LotteryConfig.MAX_ODD,
+            LotteryConfig.MIN_LOW <= low <= LotteryConfig.MAX_LOW,
+            LotteryConfig.MIN_SUM <= total_sum <= LotteryConfig.MAX_SUM,
+            GameValidator.avoid_common_patterns(game)
+        ])
 
     def _is_valid_enhanced_game(self, game: List[int], existing_games: List[List[int]]) -> bool:
-        """Validação avançada com todas as regras (quadrantes, clusters, etc.)"""
+        """Validação avançada com todas as regras"""
         if not self._is_valid_basic_game(game) or game in existing_games:
             return False
 
-        # Verificação de quadrantes
         quadrants = [AdvancedLotteryWheel.get_quadrant(num) for num in game]
-        if any(quadrants.count(q) < 2 for q in range(1, 5)):
+        if any(quadrants.count(q) < EnhancedLotteryConfig.QUADRANT_MIN for q in range(1, 5)):
             return False
 
-        # Verificação de clusters
         clusters = {self.stats.number_clusters[num] for num in game}
         if len(clusters) < 3:
             return False
 
         return True
 
-    def _generate_fallback_games(self, num_games: int) -> List[List[int]]:
-        """Geração básica de jogos como fallback quando a otimização falha"""
-        games = []
-        attempts = 0
-
-        while len(games) < num_games and attempts < num_games * 10:
-            attempts += 1
-            game = random.sample(list(self.stats.all_numbers), LotteryConfig.NUMBERS_PER_GAME)
-            if self._is_valid_basic_game(game) and game not in games:
-                games.append(game)
-
-        return games
-
     def display_advanced_stats(self, games: List[List[int]]) -> None:
-        """
-        Exibe estatísticas detalhadas dos jogos gerados.
-
-        Parâmetros:
-            games (List[List[int]]): Lista de jogos a serem analisados
-
-        Saída:
-            Imprime tabela com:
-            - Número do jogo
-            - Contagem de pares/ímpares
-            - Contagem de baixos
-            - Soma total
-            - Distribuição por quadrantes
-        """
+        """Exibe estatísticas detalhadas dos jogos gerados"""
         print("\nEstatísticas Avançadas dos Jogos:")
         print("{:<10} {:<8} {:<8} {:<8} {:<10} {:<12}".format(
             "Jogo", "Pares", "Ímpares", "Baixos", "Soma", "Quadrantes"))
@@ -1600,182 +2120,415 @@ class EnhancedLotteryGenerator(LotteryGenerator):
             print("{:<10} {:<8} {:<8} {:<8} {:<10} {:<12}".format(
                 f"Jogo {i}", even, len(game) - even, low, total, quad_dist))
 
+    def plot_game(self, game: List[int], filename: str = None):
+        """Gera visualização gráfica do jogo no volante"""
+        positions = [LotteryWheel.POSITIONS[num] for num in game]
+        x, y = zip(*positions)
+
+        plt.figure(figsize=(8, 8))
+        plt.scatter(x, y, s=500, c='red', alpha=0.7)
+
+        # Desenha linhas do volante
+        for i in range(5):
+            plt.axhline(i - 0.5, color='gray', linestyle='--', alpha=0.3)
+            plt.axvline(i - 0.5, color='gray', linestyle='--', alpha=0.3)
+
+        # Adiciona números
+        for num, (x_pos, y_pos) in LotteryWheel.POSITIONS.items():
+            plt.text(x_pos, y_pos, str(num), ha='center', va='center')
+
+        plt.title("Distribuição dos Números no Volante")
+        plt.xticks([])
+        plt.yticks([])
+        plt.xlim(-0.6, 4.6)
+        plt.ylim(-0.6, 4.6)
+
+        if filename:
+            Path(EnhancedLotteryConfig.PLOT_OUTPUT_DIR).mkdir(exist_ok=True)
+            plt.savefig(Path(EnhancedLotteryConfig.PLOT_OUTPUT_DIR) / filename)
+        plt.show()
+
+
+def _boost_cycle_numbers(self, game: List[int]) -> Optional[List[int]]:
+    """
+    Aumenta a quantidade de números com ciclos fortes.
+    Retorna o jogo ajustado ou None se não for possível.
+    """
+    current_cycle_strengths = {
+        n: self.stats.get_number_cycle_strength(n, len(self.stats.results) + 1)
+        for n in game
+    }
+
+    strong_cycle_numbers = [
+        n for n in self.stats.all_numbers
+        if n not in game
+           and self.stats.get_number_cycle_strength(n, len(self.stats.results) + 1) > 0.7
+           and self.stats.delay[n] <= LotteryConfig.MAX_DELAY
+    ]
+
+    if not strong_cycle_numbers:
+        return None
+
+    game_copy = game.copy()
+    replacements = min(
+        3 - sum(1 for s in current_cycle_strengths.values() if s > 0.5),
+        len(strong_cycle_numbers)
+    )
+
+    for _ in range(replacements):
+        worst_num = min(game_copy, key=lambda x: current_cycle_strengths.get(x, 0))
+        best_cycle_num = max(
+            strong_cycle_numbers,
+            key=lambda x: self.stats.get_number_cycle_strength(x, len(self.stats.results) + 1)
+        )
+
+        game_copy.remove(worst_num)
+        game_copy.append(best_cycle_num)
+        strong_cycle_numbers.remove(best_cycle_num)
+
+    return sorted(game_copy)
+
+
+def _calculate_number_score(self, number: int) -> float:
+    """
+    Calcula o score completo de um número individual.
+    """
+    if number in self._cached_scores:
+        return self._cached_scores[number]
+
+    try:
+        ensemble_prob = self.ensemble_model.predict_proba([number])
+        delay = self.stats.delay[number]
+        freq = self.stats.frequency[number] / max(1, len(self.stats.results))
+
+        if delay <= LotteryConfig.LOW_DELAY_THRESHOLD:
+            delay_weight = LotteryConfig.LOW_DELAY_WEIGHT
+        elif delay <= LotteryConfig.MEDIUM_DELAY_THRESHOLD:
+            delay_weight = LotteryConfig.MEDIUM_DELAY_WEIGHT
+        else:
+            delay_weight = LotteryConfig.HIGH_DELAY_WEIGHT
+
+        trend = LotteryConfig.TREND_WEIGHT if self.stats.trends[number] == "heating" else -LotteryConfig.TREND_WEIGHT
+
+        score = (
+                LotteryConfig.FREQ_WEIGHT * freq +
+                delay_weight * (1 / (delay + 1)) +
+                LotteryConfig.PROB_WEIGHT * ensemble_prob +
+                trend
+        )
+
+        self._cached_scores[number] = score
+        return score
+
+    except Exception:
+        return 0.5  # Valor padrão em caso de erro
+
+
+def _is_valid_basic_game(self, game: List[int]) -> bool:
+    """
+    Validação básica do jogo.
+    """
+    if len(game) != LotteryConfig.NUMBERS_PER_GAME:
+        return False
+
+    numbers_arr = np.array(game)
+    even = np.sum(numbers_arr % 2 == 0)
+    low = np.sum(numbers_arr <= 12)
+    total_sum = np.sum(numbers_arr)
+
+    return all([
+        LotteryConfig.MIN_EVEN <= even <= LotteryConfig.MAX_EVEN,
+        LotteryConfig.MIN_ODD <= (len(game) - even) <= LotteryConfig.MAX_ODD,
+        LotteryConfig.MIN_LOW <= low <= LotteryConfig.MAX_LOW,
+        LotteryConfig.MIN_SUM <= total_sum <= LotteryConfig.MAX_SUM,
+        GameValidator.avoid_common_patterns(game)
+    ])
+
+
+def _is_valid_enhanced_game(self, game: List[int], existing_games: List[List[int]]) -> bool:
+    """
+    Validação avançada com todas as regras.
+    """
+    if not self._is_valid_basic_game(game) or game in existing_games:
+        return False
+
+    quadrants = [AdvancedLotteryWheel.get_quadrant(num) for num in game]
+    if any(quadrants.count(q) < EnhancedLotteryConfig.QUADRANT_MIN for q in range(1, 5)):
+        return False
+
+    clusters = {self.stats.number_clusters[num] for num in game}
+    if len(clusters) < 3:
+        return False
+
+    return True
+
 
 class LotteryApp:
-    """
-    Aplicação principal que orquestra todo o processo.
-
-    Atributos:
-        results (List[List[int]]): Resultados históricos carregados
-        stats (AdvancedStatistics): Estatísticas calculadas
-        model (LotteryModelEnsemble): Modelo treinado
-        generator (EnhancedLotteryGenerator): Gerador de jogos
-        file_path (str): Caminho do arquivo carregado
-
-    Métodos Principais:
-        load_data(): Carrega dados históricos
-        initialize_components(): Prepara estatísticas e modelos
-        generate_games(): Gera jogos otimizados
-        display_games(): Exibe jogos formatados
-    """
+    """Aplicação principal completa para geração de jogos de loteria."""
 
     def __init__(self):
-        """Inicializa a aplicação com atributos vazios"""
         self.results = []
         self.stats = None
         self.model = None
         self.generator = None
         self.file_path = None
+        self._initialize_logging()
+
+    def _initialize_logging(self):
+        """Configura o sistema de logging."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('lottery_system.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
 
     def load_data(self, file_path: str) -> bool:
-        """
-        Carrega dados históricos de loteria com tratamento robusto.
-
-        Parâmetros:
-            file_path (str): Caminho do arquivo com os dados
-
-        Retorna:
-            bool: True se os dados foram carregados com sucesso
-
-        Tratamento Especial:
-            - Verifica existência do arquivo
-            - Processa Excel e texto
-            - Valida formato dos dados
-            - Remove linhas inválidas
-        """
+        """Carrega dados históricos de um arquivo."""
         try:
-            # Normaliza o caminho do arquivo
-            file_path = os.path.normpath(file_path)
+            self.logger.info(f"Carregando dados do arquivo: {file_path}")
 
             if not os.path.exists(file_path):
-                logger.error(f"Arquivo não encontrado: {file_path}")
+                self.logger.error("Arquivo não encontrado")
                 return False
 
-            # Limpa resultados anteriores
-            self.results = []
+            if os.path.getsize(file_path) == 0:
+                self.logger.error("Arquivo vazio")
+                return False
 
-            # Processa arquivos Excel
             if file_path.lower().endswith(('.xlsx', '.xls')):
-                try:
-                    if not install_excel_deps():
-                        logger.error("Dependências para Excel não disponíveis")
-                        return False
-
-                    df = pd.read_excel(file_path, header=None, engine='openpyxl')
-
-                    for _, row in df.iterrows():
-                        numbers = row.dropna().astype(int).tolist()
-                        if len(numbers) == LotteryConfig.NUMBERS_PER_GAME:
-                            self.results.append(numbers)
-                        else:
-                            logger.warning(f"Linha ignorada - quantidade inválida de números: {numbers}")
-
-                except Exception as e:
-                    logger.error(f"Erro ao processar arquivo Excel: {e}")
-                    return False
-
-            # Processa arquivos texto
+                return self._load_excel_data(file_path)
             elif file_path.lower().endswith('.txt'):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            if line.strip():
-                                numbers = list(map(int, line.strip().replace(',', ' ').split()))
-                                if len(numbers) == LotteryConfig.NUMBERS_PER_GAME:
-                                    self.results.append(numbers)
-                                else:
-                                    logger.warning(f"Linha ignorada - quantidade inválida de números: {numbers}")
-
-                except Exception as e:
-                    logger.error(f"Erro ao processar arquivo texto: {e}")
-                    return False
-
+                return self._load_text_data(file_path)
             else:
-                logger.error(f"Formato de arquivo não suportado: {file_path}")
+                self.logger.error("Formato de arquivo não suportado")
                 return False
 
-            if not self.results:
-                logger.error("Nenhum dado válido encontrado no arquivo")
+        except Exception as e:
+            self.logger.error(f"Erro ao carregar dados: {str(e)}", exc_info=True)
+            return False
+
+    def _load_excel_data(self, file_path: str) -> bool:
+        """Carrega dados de arquivo Excel."""
+        try:
+            if not self._check_excel_deps():
+                self.logger.error("Dependências para Excel não disponíveis")
                 return False
 
-            logger.info(f"Carregados {len(self.results)} jogos históricos")
+            df = pd.read_excel(file_path, header=None, engine='openpyxl')
+            valid_games = []
+
+            for idx, row in df.iterrows():
+                try:
+                    numbers = [int(num) for num in row.dropna()]
+
+                    if len(numbers) != LotteryConfig.NUMBERS_PER_GAME:
+                        self.logger.warning(f"Linha {idx + 1} ignorada - quantidade incorreta de números")
+                        continue
+
+                    if not all(1 <= num <= LotteryConfig.TOTAL_NUMBERS for num in numbers):
+                        invalid = [num for num in numbers if not 1 <= num <= LotteryConfig.TOTAL_NUMBERS]
+                        self.logger.warning(f"Linha {idx + 1} ignorada - números inválidos: {invalid}")
+                        continue
+
+                    valid_games.append(numbers)
+
+                except ValueError as e:
+                    self.logger.warning(f"Linha {idx + 1} ignorada - erro de conversão: {str(e)}")
+                    continue
+
+            if not valid_games:
+                self.logger.error("Nenhum jogo válido encontrado")
+                return False
+
+            self.results = valid_games
+            self.file_path = file_path
+            self.logger.info(f"Carregados {len(valid_games)} jogos válidos")
             return True
 
         except Exception as e:
-            logger.error(f"Erro inesperado ao carregar dados: {e}")
+            self.logger.error(f"Erro ao processar Excel: {str(e)}", exc_info=True)
             return False
+
+    def _load_text_data(self, file_path: str) -> bool:
+        """Carrega dados de arquivo texto."""
+        try:
+            valid_games = []
+
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    try:
+                        if not line.strip():
+                            continue
+
+                        numbers = [int(num) for num in line.strip().replace(',', ' ').split()]
+
+                        if len(numbers) != LotteryConfig.NUMBERS_PER_GAME:
+                            self.logger.warning(f"Linha {line_num} ignorada - quantidade incorreta de números")
+                            continue
+
+                        if not all(1 <= num <= LotteryConfig.TOTAL_NUMBERS for num in numbers):
+                            invalid = [num for num in numbers if not 1 <= num <= LotteryConfig.TOTAL_NUMBERS]
+                            self.logger.warning(f"Linha {line_num} ignorada - números inválidos: {invalid}")
+                            continue
+
+                        valid_games.append(numbers)
+
+                    except ValueError as e:
+                        self.logger.warning(f"Linha {line_num} ignorada - erro de conversão: {str(e)}")
+                        continue
+
+            if not valid_games:
+                self.logger.error("Nenhum jogo válido encontrado")
+                return False
+
+            self.results = valid_games
+            self.file_path = file_path
+            self.logger.info(f"Carregados {len(valid_games)} jogos válidos")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Erro ao processar arquivo texto: {str(e)}", exc_info=True)
+            return False
+
+    def _check_excel_deps(self) -> bool:
+        """Verifica dependências para Excel."""
+        try:
+            import openpyxl
+            return True
+        except ImportError:
+            try:
+                import subprocess
+                subprocess.check_call(['pip', 'install', 'openpyxl'])
+                return True
+            except:
+                return False
 
     def initialize_components(self) -> bool:
-        """
-        Inicializa todos os componentes necessários para geração.
-
-        Retorna:
-            bool: True se inicializado com sucesso
-
-        Componentes Inicializados:
-            1. AdvancedStatistics: Cálculo de estatísticas avançadas
-            2. LotteryModelEnsemble: Treinamento do ensemble
-            3. EnhancedLotteryGenerator: Preparação do gerador
-        """
-        if not self.results:
-            logger.error("Dados não carregados. Execute load_data() primeiro")
-            return False
-
+        """Inicializa todos os componentes do sistema."""
         try:
-            self.stats = AdvancedStatistics(self.results)
-            self.model = LotteryModelEnsemble(self.stats)
-            self.generator = EnhancedLotteryGenerator(self.stats, self.model)
-            logger.info("Componentes inicializados com sucesso")
-            return True
+            min_required = max(15, LotteryConfig.TREND_WINDOW_SIZE * 2)
+            if len(self.results) < min_required:
+                self.logger.error(f"Dados insuficientes. Mínimo requerido: {min_required} jogos")
+                return False
+
+            self.logger.info("Calculando estatísticas...")
+            try:
+                self.stats = AdvancedStatistics(self.results)
+                self.logger.info("Estatísticas calculadas com sucesso")
+            except Exception as e:
+                self.logger.error(f"Falha no cálculo de estatísticas: {str(e)}", exc_info=True)
+                return False
+
+            self.logger.info("Inicializando modelos...")
+            try:
+                self.model = LotteryModelEnsemble(self.stats)
+                self.logger.info("Modelos inicializados com sucesso")
+            except Exception as e:
+                self.logger.error(f"Falha na inicialização dos modelos: {str(e)}", exc_info=True)
+                return False
+
+            self.logger.info("Inicializando gerador...")
+            try:
+                self.generator = EnhancedLotteryGenerator(self.stats, self.model)
+                self.logger.info("Componentes inicializados com sucesso")
+                return True
+            except Exception as e:
+                self.logger.error(f"Falha no gerador: {str(e)}", exc_info=True)
+                return False
+
         except Exception as e:
-            logger.error(f"Erro ao inicializar componentes: {e}")
+            self.logger.critical(f"Falha na inicialização: {str(e)}", exc_info=True)
             return False
 
     def generate_games(self, num_games: int = None) -> List[List[int]]:
-        """
-        Gera jogos otimizados com tratamento de erros.
+        """Gera jogos otimizados com fallback controlado."""
+        num_games = num_games or LotteryConfig.GAMES_TO_GENERATE
 
-        Parâmetros:
-            num_games (int): Quantidade de jogos a gerar (opcional)
-
-        Retorna:
-            List[List[int]]: Lista de jogos gerados ou lista vazia se falhar
-        """
         if not all([self.stats, self.model, self.generator]):
-            logger.error("Componentes não inicializados. Execute initialize_components() primeiro")
+            self.logger.error("Componentes não inicializados corretamente")
             return []
 
-        num_games = num_games or LotteryConfig.GAMES_TO_GENERATE
         try:
+            self.logger.info(f"Iniciando geração de {num_games} jogos")
             games = self.generator.generate_optimized_games(num_games)
-            logger.info(f"{len(games)} jogos gerados com sucesso")
+
+            if len(games) < num_games:
+                self.logger.warning(f"Apenas {len(games)}/{num_games} jogos puderam ser gerados")
+
             return games
+
         except Exception as e:
-            logger.error(f"Erro ao gerar jogos: {e}")
+            self.logger.error(f"Erro ao gerar jogos: {str(e)}", exc_info=True)
             return []
 
     def display_games(self, games: List[List[int]]) -> None:
-        """
-        Exibe jogos formatados exatamente como solicitado.
-
-        Parâmetros:
-            games (List[List[int]]): Lista de jogos a serem exibidos
-
-        Saída:
-            Imprime cada jogo no formato:
-            Sequencia 1: [ 1, 2, 3, ..., 15 ]
-            Sequencia 2: [ 2, 4, 6, ..., 16 ]
-            ...
-        """
+        """Exibe os jogos formatados corretamente como inteiros simples"""
         if not games:
-            print("Nenhum jogo para exibir")
+            print("\nNenhum jogo foi gerado.")
             return
 
         print("\nJogos gerados:")
         for i, game in enumerate(games, 1):
-            formatted_numbers = [f"{num:2}" for num in sorted(game)]
-            print(f"Sequencia {i}: [ {', '.join(formatted_numbers)} ]")
+            # Garante que todos os números são inteiros Python
+            converted_game = [int(num) for num in game]
+            print(f"Jogo {i}: {sorted(converted_game)}")
 
+    def save_games(self, games: List[List[int]], filename: str = "jogos_gerados.txt") -> bool:
+        """Salva os jogos garantindo que todos os números são inteiros Python"""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                for game in games:
+                    # Garante conversão para inteiros Python
+                    converted_game = [int(num) for num in game]
+                    f.write(" ".join(map(str, sorted(converted_game))) + "\n")
+            self.logger.info(f"Jogos salvos em {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Erro ao salvar jogos: {str(e)}", exc_info=True)
+            return False
+
+    def display_advanced_stats(self, games: List[List[int]]) -> None:
+        """Exibe estatísticas avançadas com conversão de tipos"""
+        if not games:
+            print("Nenhum jogo para exibir estatísticas")
+            return
+
+        print("\nEstatísticas Avançadas:")
+        print("{:<10} {:<8} {:<8} {:<8} {:<10}".format(
+            "Jogo", "Pares", "Ímpares", "Baixos", "Soma"))
+
+        for i, game in enumerate(games, 1):
+            # Garante conversão para inteiros Python
+            numbers = np.array([int(num) for num in game])
+            even = np.sum(numbers % 2 == 0)
+            low = np.sum(numbers <= 12)
+            total = np.sum(numbers)
+
+            print("{:<10} {:<8} {:<8} {:<8} {:<10}".format(
+                f"Jogo {i}", even, len(game) - even, low, total))
+
+    def display_advanced_stats(self, games: List[List[int]]) -> None:
+        """Exibe estatísticas avançadas dos jogos."""
+        if not games:
+            print("Nenhum jogo para exibir estatísticas")
+            return
+
+        print("\nEstatísticas Avançadas:")
+        print("{:<10} {:<8} {:<8} {:<8} {:<10}".format(
+            "Jogo", "Pares", "Ímpares", "Baixos", "Soma"))
+
+        for i, game in enumerate(games, 1):
+            numbers = np.array(game)
+            even = np.sum(numbers % 2 == 0)
+            low = np.sum(numbers <= 12)
+            total = np.sum(numbers)
+
+            print("{:<10} {:<8} {:<8} {:<8} {:<10}".format(
+                f"Jogo {i}", even, len(game) - even, low, total))
 
 def check_dependencies():
     """
@@ -1813,19 +2566,27 @@ def check_dependencies():
                 print(f"✗ Falha ao instalar {lib}")
 
 
-def main():
-    """
-    Função principal com tratamento completo de erros.
+def save_games(self, games: List[List[int]], filename: str = "jogos_gerados.txt"):
+    """Salva os jogos gerados em arquivo"""
+    with open(filename, 'w') as f:
+        for game in games:
+            f.write(" ".join(map(str, sorted(game))) + "\n")
+    logger.info(f"Jogos salvos em {filename}")
 
-    Fluxo:
-    1. Verifica dependências
-    2. Cria instância da aplicação
-    3. Seleciona e carrega arquivo
-    4. Inicializa componentes
-    5. Gera e exibe jogos
-    6. Trata possíveis erros
-    """
-    print("=== SISTEMA AVANÇADO DE GERAÇÃO DE JOGOS DE LOTERIA ===")
+
+def display_advanced_stats(self, games: List[List[int]]):
+    """Exibe estatísticas avançadas com visualização"""
+    super().display_advanced_stats(games)
+
+    # Gera gráficos para os primeiros 3 jogos
+    for i, game in enumerate(games[:3], 1):
+        self.generator.plot_game(game, f"jogo_{i}.png")
+
+
+def main():
+    """Função principal com correções para solicitar o arquivo"""
+    print("=== SISTEMA AVANÇADO DE GERAÇÃO DE JOGOS DE LOTERIA v2.0 ===")
+    print("=== Desenvolvido por Natanael ===\n")
 
     try:
         # Verifica dependências
@@ -1833,43 +2594,64 @@ def main():
 
         app = LotteryApp()
 
-        # 1. Seleção do arquivo
-        print("\nSelecione o arquivo com resultados históricos...")
-        file_path = FileHandler.select_file()
+        # 1. Solicitação do arquivo de forma explícita
+        print("\n[1/4] Selecione o arquivo com resultados históricos:")
+        print("Por favor, escolha um arquivo Excel (.xlsx) ou texto (.txt) contendo os resultados anteriores.")
 
-        if not file_path:
-            print("\nNenhum arquivo selecionado. Criando arquivo de exemplo...")
-            FileHandler.create_example_file("resultados_exemplo.xlsx")
-            print("Arquivo de exemplo criado: 'resultados_exemplo.xlsx'")
-            print("Por favor, preencha com seus dados e execute novamente.")
-            return
+        while True:
+            file_path = FileHandler.select_file()
+            if file_path:
+                break
+            print("\nNenhum arquivo selecionado. Por favor, selecione um arquivo válido.")
 
-        # 2. Carregamento de dados
-        print(f"\nCarregando dados de: {file_path}")
+        # 2. Carregamento dos dados
+        print(f"\n[2/4] Carregando dados de: {file_path}")
         if not app.load_data(file_path):
-            print("\nERRO: Não foi possível carregar os dados.")
+            print("\nERRO: Não foi possível carregar os dados. Verifique o formato do arquivo.")
+            input("Pressione Enter para sair...")
             return
 
         # 3. Inicialização do sistema
-        print("\nInicializando componentes avançados...")
+        print("\n[3/4] Inicializando componentes...")
         if not app.initialize_components():
             print("\nERRO: Falha ao inicializar o sistema.")
+            input("Pressione Enter para sair...")
             return
 
         # 4. Geração de jogos
-        print("\nGerando jogos otimizados com técnicas avançadas...")
-        games = app.generate_games()
+        print("\n[4/4] Gerando jogos otimizados")
+        while True:
+            try:
+                num_games = input("\nQuantos jogos deseja gerar? (Padrão=7, Máximo=50): ").strip()
+                num_games = int(num_games) if num_games else LotteryConfig.GAMES_TO_GENERATE
+                if 1 <= num_games <= 50:
+                    break
+                print("Por favor, digite um número entre 1 e 50.")
+            except ValueError:
+                print("Entrada inválida. Usando valor padrão (7).")
+                num_games = LotteryConfig.GAMES_TO_GENERATE
+                break
 
-        if not games:
-            print("\nERRO: Nenhum jogo foi gerado.")
-        else:
-            app.display_games(games)
+        games = app.generate_games(num_games)
+        app.display_games(games)
+
+        # Opções adicionais
+        print("\nDeseja ver estatísticas detalhadas? (S/N)")
+        if input().strip().lower() == 's':
+            app.display_advanced_stats(games)
+
+        print("\nDeseja salvar os jogos gerados? (S/N)")
+        if input().strip().lower() == 's':
+            filename = input("Nome do arquivo (deixe em branco para 'jogos_gerados.txt'): ").strip()
+            filename = filename or "jogos_gerados.txt"
+            app.save_games(games, filename)
+            print(f"Jogos salvos em {filename}")
 
     except Exception as e:
-        logger.exception("Erro fatal durante a execução")
         print(f"\nERRO INESPERADO: {str(e)}")
     finally:
-        input("\nPressione Enter para sair...")
+        print("\nProcesso concluído.")
+        input("Pressione Enter para sair...")
 
 
 if __name__ == "__main__":
